@@ -38,6 +38,7 @@ class MockTokenizer:
 
     def __init__(self):
         self.eos_token_id = 2
+        self.tool_parser = None
 
     def encode(self, text: str) -> List[int]:
         return [100 + i for i, _ in enumerate(text.split())]

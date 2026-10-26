@@ -6322,10 +6322,10 @@ def _tool_call_failure(
 ) -> dict | None:
     failed = () if extraction is None else extraction.parse_errors
     has_calls = bool(extraction and extraction.tool_calls)
-    if failed:
-        code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
-    elif withheld_payload and not has_calls:
+    if "incomplete" in failed or (withheld_payload and not has_calls):
         code = "incomplete_tool_call"
+    elif failed:
+        code = "invalid_tool_call"
     else:
         return None
     message = (
