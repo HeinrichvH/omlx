@@ -5366,7 +5366,7 @@ async def create_chat_completion(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                recovered = _nonstream_recovery_text(
+                recovered, withheld_payload = _nonstream_recovery_text(
                     extraction,
                     regular_content,
                     output,
@@ -5375,7 +5375,9 @@ async def create_chat_completion(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                elif failure := _tool_call_failure(
+                    extraction, withheld_payload=withheld_payload
+                ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -6313,19 +6315,42 @@ class _ToolCallGenerationError(HTTPException):
         self.code = error["code"]
 
 
-def _tool_call_failure(extraction: ToolCallExtraction) -> dict | None:
-    failed = extraction.parse_errors
-    if not failed:
+def _tool_call_failure(
+    extraction: ToolCallExtraction | None = None,
+    *,
+    withheld_payload: bool = False,
+) -> dict | None:
+    failed = () if extraction is None else extraction.parse_errors
+    has_calls = bool(extraction and extraction.tool_calls)
+    if failed:
+        code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
+    elif withheld_payload and not has_calls:
+        code = "incomplete_tool_call"
+    else:
         return None
-    code = "incomplete_tool_call" if "incomplete" in failed else "invalid_tool_call"
     message = (
         "Model output contains an unrecoverable tool call. "
         "Previously delivered tool calls must not be executed again on retry."
     )
     logger.warning(
-        "Tool call generation failed: code=%s, failed_calls=%d", code, len(failed)
+        "Tool call generation failed: code=%s, failed_calls=%d",
+        code,
+        len(failed) or 1,
     )
     return _openai_error_body(message, 500, code=code)
+
+
+def _recovery_candidate_is_payload(
+    tool_filter: ToolCallStreamFilter | None,
+    thinking_filter: ToolCallStreamFilter | None,
+) -> bool:
+    """Whether either channel withheld a truncated call, not quoted prose.
+
+    Must be read before ``take_recovery_candidate``: taking clears the tail.
+    """
+    return any(
+        f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
+    )
 
 
 def _take_recoverable_withheld_text(
@@ -6339,21 +6364,48 @@ def _take_recoverable_withheld_text(
 
     A marker quoted in prose fails parsing as "incomplete" like a truncated
     call. Recover the text only when no call was produced, every error is
-    "incomplete" and no withheld opener in either channel starts a payload.
+    "incomplete", and no withheld opener in either channel starts a payload.
+    A payload is never recovered as content, even when parse_errors is empty
+    (parsers other than qwen3_coder do not populate parse_errors).
     """
-    is_payload = any(
-        f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
-    )
+    is_payload = _recovery_candidate_is_payload(tool_filter, thinking_filter)
     thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
     content = tool_filter.take_recovery_candidate() if tool_filter else ""
     if (
         tool_calls
         or streamed_tool_calls
         or any(error != "incomplete" for error in parse_errors)
-        or (parse_errors and is_payload)
+        or is_payload
     ):
         return "", ""
     return thinking, content
+
+
+def _finalize_withheld_recovery(
+    tool_filter: ToolCallStreamFilter | None,
+    thinking_filter: ToolCallStreamFilter | None,
+    tool_calls: object,
+    parse_errors: tuple,
+    tool_failure: dict | None,
+    streamed_tool_calls: list | None = None,
+) -> tuple[str, str, dict | None]:
+    """Recover quoted-marker prose, or fail a withheld truncated payload.
+
+    Do not clear an existing tool_failure when recovery is skipped because
+    the withheld tail is a payload. Surface incomplete_tool_call when a
+    payload was withheld and no structured tool_calls were produced, even
+    if parse_errors is empty.
+    """
+    withheld_payload = _recovery_candidate_is_payload(tool_filter, thinking_filter)
+    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
+        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
+    )
+    if recovered_thinking or recovered_content:
+        # The marker was quoted in prose, so this is not a failed tool call.
+        return recovered_thinking, recovered_content, None
+    if not tool_failure and withheld_payload and not tool_calls:
+        tool_failure = _tool_call_failure(withheld_payload=True)
+    return recovered_thinking, recovered_content, tool_failure
 
 
 def _nonstream_recovery_text(
@@ -6362,13 +6414,18 @@ def _nonstream_recovery_text(
     output: GenerationOutput,
     tokenizer: object,
     tools: object,
-) -> str | None:
-    """Return the raw answer when the only failure is a marker quoted in prose."""
+) -> tuple[str | None, bool]:
+    """Return (recovered answer, withheld_payload).
+
+    Recover the raw answer only when the withheld tail is a marker quoted
+    in prose. A truncated call payload is never recovered as content, even
+    when parse_errors is empty (non-qwen3_coder).
+    """
     if extraction.tool_calls:
-        return None
+        return None, False
     failed = extraction.parse_errors
-    if not failed or any(error != "incomplete" for error in failed):
-        return None
+    if any(error != "incomplete" for error in failed):
+        return None, False
     # Judge the text the stream filter would see, before special tokens are
     # cleaned out of it.
     _, generated = extract_thinking(
@@ -6379,9 +6436,13 @@ def _nonstream_recovery_text(
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
     probe.feed(generated)
     probe.finish()
-    if probe.recovery_candidate_is_payload() or not probe.take_recovery_candidate():
-        return None
-    return raw_text
+    withheld_payload = probe.recovery_candidate_is_payload()
+    recovered = probe.take_recovery_candidate()
+    if withheld_payload:
+        return None, True
+    if recovered:
+        return raw_text, False
+    return None, False
 
 
 def _registered_tool_names(tools: object) -> set[str]:
@@ -6931,12 +6992,14 @@ async def stream_chat_completion(
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
-    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
+    recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
+        tool_filter,
+        thinking_filter,
+        tool_calls,
+        parse_errors,
+        tool_failure,
+        streamed_tool_calls,
     )
-    if recovered_thinking or recovered_content:
-        # The marker was quoted in prose, so this is not a failed tool call.
-        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             accumulated_reasoning += recovered_thinking
@@ -7499,12 +7562,9 @@ async def stream_anthropic_messages(
         parse_errors = extraction.parse_errors
         tool_failure = _tool_call_failure(extraction)
 
-    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors
+    recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
+        tool_filter, thinking_filter, tool_calls, parse_errors, tool_failure
     )
-    if recovered_thinking or recovered_content:
-        # The marker was quoted in prose, so this is not a failed tool call.
-        tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
             if text_block_started:
@@ -8057,7 +8117,7 @@ async def create_anthropic_message(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                recovered = _nonstream_recovery_text(
+                recovered, withheld_payload = _nonstream_recovery_text(
                     extraction,
                     regular_content,
                     output,
@@ -8066,7 +8126,9 @@ async def create_anthropic_message(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                elif failure := _tool_call_failure(
+                    extraction, withheld_payload=withheld_payload
+                ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -8842,7 +8904,7 @@ async def create_response(
                 )
                 cleaned_text = extraction.cleaned_text
                 tool_calls = extraction.tool_calls
-                recovered = _nonstream_recovery_text(
+                recovered, withheld_payload = _nonstream_recovery_text(
                     extraction,
                     regular_content,
                     output,
@@ -8851,7 +8913,9 @@ async def create_response(
                 )
                 if recovered is not None:
                     cleaned_text = recovered
-                elif failure := _tool_call_failure(extraction):
+                elif failure := _tool_call_failure(
+                    extraction, withheld_payload=withheld_payload
+                ):
                     raise _ToolCallGenerationError(failure["error"])
                 cleaned_thinking = extraction.cleaned_thinking
 
@@ -9435,12 +9499,9 @@ async def stream_responses_api(
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
-    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors
+    recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
+        tool_filter, thinking_filter, tool_calls, parse_errors, tool_failure
     )
-    if recovered_thinking or recovered_content:
-        # The marker was quoted in prose, so this is not a failed tool call.
-        tool_failure = None
     if recovered_content:
         # The parser strips the prose before the marker, so rebuild the final
         # text from the raw answer to match the streamed deltas.

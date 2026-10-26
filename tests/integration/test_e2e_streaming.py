@@ -4677,10 +4677,16 @@ _RECOVERY_CALL = (
 
 
 async def _recovery_stream(
-    raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False
+    raw,
+    api="chat",
+    chunk_size=7,
+    finish_reason="stop",
+    closed=None,
+    cancel=False,
+    *,
+    tools=None,
+    qwen_parser=True,
 ):
-    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
-
     from omlx.api.anthropic_models import MessagesRequest
     from omlx.api.openai_models import ChatCompletionRequest
     from omlx.api.responses_models import ResponsesRequest
@@ -4695,7 +4701,11 @@ async def _recovery_stream(
     engine.tokenizer.has_tool_calling = True
     engine.tokenizer.tool_call_start = "<tool_call>"
     engine.tokenizer.tool_call_end = "</tool_call>"
-    engine.tokenizer.tool_parser = parse_tool_call
+    if qwen_parser:
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        engine.tokenizer.tool_parser = parse_tool_call
+    stream_tools = tools if tools is not None else _RECOVERY_TOOLS
     engine.set_stream_outputs(
         [
             MockGenerationOutput(
@@ -4720,19 +4730,19 @@ async def _recovery_stream(
     if api == "chat":
         request = ChatCompletionRequest(model="test", messages=messages, stream=True)
         stream = stream_chat_completion(
-            engine, messages, request, tools=_RECOVERY_TOOLS
+            engine, messages, request, tools=stream_tools
         )
     elif api == "anthropic":
         request = MessagesRequest(
             model="test", messages=messages, max_tokens=1024, stream=True
         )
         stream = stream_anthropic_messages(
-            engine, messages, request, tools=_RECOVERY_TOOLS
+            engine, messages, request, tools=stream_tools
         )
     else:
         request = ResponsesRequest(model="test", input="Write hello", stream=True)
         stream = stream_responses_api(
-            engine, messages, request, tools=_RECOVERY_TOOLS, store_response=False
+            engine, messages, request, tools=stream_tools, store_response=False
         )
     events = []
     async for event in stream:
@@ -4915,6 +4925,35 @@ _RECOVERY_MALFORMED_CLOSED = (
 )
 _RECOVERY_TRUNCATED_JSON = '<tool_call>{"name":"write","arguments":{"content":"cut'
 
+# Exact issue-body sample from #3153. Option 1 (close the envelope and recover
+# a structured websearch call) is intentionally skipped: the model omitted
+# </function></tool_call> and used bare query= rather than <parameter=query>.
+# Inventing those closers/args would hide the incomplete_tool_call failure.
+_ISSUE_3153_UNCLOSED = (
+    "I have comprehensive material. Let me do one final targeted check...\n"
+    "\n"
+    "<tool_call>\n"
+    "<function=websearch>\n"
+    'query="Flowable Work platform-api analytics process-instance query '
+    'endpoint frequency duration chart data REST" numResults=5'
+)
+_ISSUE_3153_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "websearch",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "numResults": {"type": "integer"},
+                },
+            },
+        },
+    }
+]
+_ISSUE_3153_FRAGMENT = "<tool_call>\n<function=websearch>"
+
 
 def _recovery_text(events, api):
     if api == "chat":
@@ -4958,6 +4997,16 @@ async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size)
 
 
 @pytest.mark.asyncio
+async def test_recoverable_quoted_marker_without_qwen_parser():
+    """Quoted-marker prose must still recover when parse_errors is empty."""
+    events = await _recovery_stream(_RECOVERY_PROSE, "chat", qwen_parser=False)
+
+    assert _recovery_error_codes(events, "chat") == []
+    assert _recovery_text(events, "chat") == _RECOVERY_PROSE
+    assert _chat_finish_reasons(events) == ["stop"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize(
     "raw,visible",
@@ -4979,6 +5028,49 @@ async def test_withheld_tool_payload_is_not_recovered(api, raw, visible):
     assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
     assert not _recovery_calls(events, api)
     assert _recovery_text(events, api) == visible
+
+
+def _chat_finish_reasons(events):
+    return [
+        c["finish_reason"]
+        for e in events
+        for c in e.get("choices", [])
+        if c.get("finish_reason")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "qwen_parser",
+    [True, False],
+    ids=["qwen3_coder", "no_qwen_parser"],
+)
+async def test_unclosed_tool_envelope_3153_is_not_stop_content(api, qwen_parser):
+    """Unclosed tool envelope at EOF must not finish as ordinary stop content.
+
+    Companion ``no_qwen_parser`` covers parsers that leave parse_errors empty.
+    """
+    events = await _recovery_stream(
+        _ISSUE_3153_UNCLOSED,
+        api,
+        tools=_ISSUE_3153_TOOLS,
+        qwen_parser=qwen_parser,
+    )
+    content = _recovery_text(events, api)
+    # Falsifier from the issue: success-looking stop plus the withheld fragment.
+    if api == "chat":
+        assert not (
+            _chat_finish_reasons(events) == ["stop"]
+            and _ISSUE_3153_FRAGMENT in content
+        )
+        assert not any(
+            c.get("finish_reason") for e in events for c in e.get("choices", [])
+        )
+    assert _ISSUE_3153_FRAGMENT not in content
+    assert "<function=websearch>" not in content
+    assert _recovery_error_codes(events, api) == ["incomplete_tool_call"]
+    assert not _recovery_calls(events, api)
 
 
 @pytest.mark.asyncio
@@ -5006,13 +5098,12 @@ async def test_recovered_prose_reaches_responses_final_text():
     assert done == completed == [_RECOVERY_PROSE]
 
 
-def _nonstream_tool_call_client(monkeypatch, body: str):
+def _nonstream_tool_call_client(monkeypatch, body: str, *, qwen_parser=True):
     """Return a client whose model generates ``body`` for non-stream requests."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
     from fastapi.testclient import TestClient
-    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
     from omlx.engine.batched import BatchedEngine
     from omlx.server import _server_state, app
@@ -5024,7 +5115,10 @@ def _nonstream_tool_call_client(monkeypatch, body: str):
     engine._tokenizer.has_tool_calling = True
     engine._tokenizer.tool_call_start = "<tool_call>"
     engine._tokenizer.tool_call_end = "</tool_call>"
-    engine._tokenizer.tool_parser = parse_tool_call
+    if qwen_parser:
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        engine._tokenizer.tool_parser = parse_tool_call
     engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=object()))
     monkeypatch.setattr(engine, "_preflight_or_raise_with_eviction", AsyncMock())
 
@@ -5131,6 +5225,32 @@ def test_nonstream_truncated_or_malformed_call_still_fails(monkeypatch, raw):
 
     assert response.status_code == 500, response.text
     assert response.json()["error"]["code"] == "incomplete_tool_call"
+
+
+@pytest.mark.parametrize(
+    "qwen_parser",
+    [True, False],
+    ids=["qwen3_coder", "no_qwen_parser"],
+)
+def test_unclosed_tool_envelope_3153_nonstream_is_not_stop(monkeypatch, qwen_parser):
+    request = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Search"}],
+        "stream": False,
+        "tools": _ISSUE_3153_TOOLS,
+    }
+    client = _nonstream_tool_call_client(
+        monkeypatch, _ISSUE_3153_UNCLOSED, qwen_parser=qwen_parser
+    )
+    response = client.post("/v1/chat/completions", json=request)
+    client.close()
+
+    assert response.status_code == 500, response.text
+    body = response.json()
+    assert body["error"]["code"] == "incomplete_tool_call"
+    # Falsifier: a 200 stop completion that leaked the withheld fragment.
+    assert "choices" not in body
+    assert _ISSUE_3153_FRAGMENT not in response.text
 
 
 @pytest.mark.asyncio
