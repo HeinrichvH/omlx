@@ -1962,12 +1962,13 @@ def _gemma4_reassemble_extras(arguments: dict, props: dict) -> Optional[dict]:
             continue
         if isinstance(value, str):
             extras.append(key + ":" + value)
-        elif isinstance(value, (list, tuple)) and all(
+            continue
+        if isinstance(value, (list, tuple)) and all(
             isinstance(item, str) for item in value
         ):
             extras.append(key + ":" + json.dumps(value))
-        else:
-            extras_ok = False
+            continue
+        extras_ok = False
     if not extras_ok or not extras or not leading:
         return None
     target, target_value = leading[-1]
