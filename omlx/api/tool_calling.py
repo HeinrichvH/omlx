@@ -239,18 +239,21 @@ def _args_fit_schema(
         or len(arguments) <= len(props)
     ):
         return arguments
-    if reassemble is not None:
-        fitted = reassemble(arguments, props)
-        if isinstance(fitted, dict) and len(fitted) <= len(props):
-            return fitted
-    logger.warning(
-        "args: got %d keys, schema declares %d — dropping truncated "
-        "tool call %r",
-        len(arguments),
-        len(props),
-        func_name,
-    )
-    return None
+    elif (
+        reassemble is not None
+        and isinstance((fitted := reassemble(arguments, props)), dict)
+        and len(fitted) <= len(props)
+    ):
+        return fitted
+    else:
+        logger.warning(
+            "args: got %d keys, schema declares %d — dropping truncated "
+            "tool call %r",
+            len(arguments),
+            len(props),
+            func_name,
+        )
+        return None
 
 
 def _merge_json_fragments(val: str, spec: Any) -> Optional[list]:
