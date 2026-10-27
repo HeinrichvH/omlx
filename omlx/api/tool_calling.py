@@ -1945,53 +1945,40 @@ def _gemma4_param_properties(func_name: str, tools: Optional[List]) -> dict:
 def _gemma4_reassemble_extras(arguments: dict, props: dict) -> Optional[dict]:
     """Rejoin Gemma 4 ``<|"|>`` fragments spilled into extra keys (#3229).
 
-    When the model closes the delimiter at markdown ``**Label:**``, extras
-    after the unique string-typed schema field ``T`` are ``key + ":" +
-    value`` pieces of ``D[T]``.  Returns the leading schema keys plus
-    rebuilt ``T``, or ``None`` when the shape does not match.
+    One insertion-order pass, same refuse-with-None shape as
+    ``_merge_json_fragments``: schema keys before the last one stay; extras
+    after it are ``key + ":" + value`` pieces of that field.  The last
+    schema key must be the unique string-typed field with no schema key
+    after it.  Interleaved extras are dropped, not joined.
     """
-    keys = list(arguments)
-    schema_keys = set(props)
-    targets: list[str] = []
-    for i, key in enumerate(keys):
-        if key not in schema_keys or not _schema_declares_string(props.get(key)):
-            continue
-        after = keys[i + 1 :]
-        if not after or any(k in schema_keys for k in after):
-            continue
-        targets.append(key)
-    if len(targets) != 1:
+    leading: list[tuple[str, Any]] = []
+    extras: list[tuple[str, Any]] = []
+    for key, value in arguments.items():
+        if key in props:
+            leading.append((key, value))
+            extras = []
+        else:
+            extras.append((key, value))
+    if not extras or not leading:
         return None
-
-    target = targets[0]
-    target_value = arguments[target]
-    if not isinstance(target_value, str):
+    target, target_value = leading[-1]
+    if not isinstance(target_value, str) or not _schema_declares_string(
+        props.get(target)
+    ):
         return None
-
-    extras_start = keys.index(target) + 1
-    extra_items = [(k, arguments[k]) for k in keys[extras_start:]]
-    if not extra_items:
-        return None
-    for _, extra_val in extra_items:
+    rebuilt = [target_value]
+    for extra_key, extra_val in extras:
         if isinstance(extra_val, str):
-            continue
-        if isinstance(extra_val, (list, tuple)) and all(
+            piece = extra_val
+        elif isinstance(extra_val, (list, tuple)) and all(
             isinstance(item, str) for item in extra_val
         ):
-            continue
-        return None
-
-    rebuilt = target_value
-    for extra_key, extra_val in extra_items:
-        piece = extra_val if isinstance(extra_val, str) else json.dumps(extra_val)
-        rebuilt += extra_key + ":" + piece
-
-    kept = {
-        k: arguments[k]
-        for k in keys[: extras_start - 1]
-        if k in schema_keys
-    }
-    kept[target] = rebuilt
+            piece = json.dumps(extra_val)
+        else:
+            return None
+        rebuilt.append(extra_key + ":" + piece)
+    kept = dict(leading[:-1])
+    kept[target] = "".join(rebuilt)
     logger.warning(
         "gemma4 args: got %d keys, schema declares %d — reassembled "
         'fragmented <|"|> extras',
