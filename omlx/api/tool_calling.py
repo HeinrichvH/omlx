@@ -1863,7 +1863,138 @@ def _gemma4_args_to_json_legacy(args_str: str) -> dict:
     return result
 
 
-def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
+def _schema_declares_string(spec: Any) -> bool:
+    """True when a JSON Schema property admits a string value (#3229)."""
+    if not isinstance(spec, dict):
+        return False
+    raw = spec.get("type")
+    if isinstance(raw, str):
+        types: list[Any] = [raw]
+    elif isinstance(raw, list):
+        types = raw
+    else:
+        union = _union_keyword_types(spec)
+        types = list(union) if union else []
+    return any(
+        isinstance(t, str) and t.strip().lower() in _SCHEMA_STRING_TYPES
+        for t in types
+    )
+
+
+def _gemma4_joinable_extra_value(value: Any) -> bool:
+    """Extra fragments are a string, or a list/tuple of only strings."""
+    if isinstance(value, str):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(isinstance(item, str) for item in value)
+    return False
+
+
+def _gemma4_schema_properties(func_name: str, tools: Optional[List]) -> dict:
+    """Schema properties for a Gemma 4 call, including namespaced names.
+
+    ``call:google:mcp:...:create-pdf-file`` must still see the registered
+    ``create-pdf-file`` schema.  Uses the same ``:``-boundary suffix rule as
+    ``_remap_tool_call_names`` so the #3229 tripwire fires on the payload
+    that actually reaches clients.
+    """
+    props = _tool_param_properties(func_name, tools)
+    if props or not tools or not func_name or ":" not in func_name:
+        return props
+    valid_names = _extract_tool_names(tools)
+    if func_name in valid_names:
+        return props
+    parts = func_name.split(":")
+    suffixes = {":".join(parts[i:]) for i in range(1, len(parts))}
+    candidates = suffixes & valid_names
+    if len(candidates) != 1:
+        return props
+    return _tool_param_properties(next(iter(candidates)), tools)
+
+
+def _gemma4_reassemble_or_reject_fragmented_args(
+    arguments: dict,
+    func_name: str,
+    tools: Optional[List],
+) -> Optional[dict]:
+    """Keep, reassemble, or reject Gemma 4 args that outrun the tool schema.
+
+    When the model spuriously closes ``<|"|>`` at a markdown ``**Label:**``,
+    the transcoder yields valid JSON with extra top-level keys (#3229).  If
+    the parsed object has more keys than the schema declares, try to rejoin
+    consecutive extra fragments into the unique string-typed schema field
+    they spilled from.  Return ``None`` when the tripwire fires but the
+    shape is not reassembled, so callers do not emit a silently truncated
+    tool call.
+    """
+    if not isinstance(arguments, dict):
+        return arguments
+    props = _gemma4_schema_properties(func_name, tools)
+    if not props or len(arguments) <= len(props):
+        return arguments
+
+    keys = list(arguments)
+    schema_keys = set(props)
+    targets: list[str] = []
+    for i, key in enumerate(keys):
+        if key not in schema_keys:
+            continue
+        if not _schema_declares_string(props.get(key)):
+            continue
+        after = keys[i + 1 :]
+        if not after or any(k in schema_keys for k in after):
+            continue
+        targets.append(key)
+
+    n_keys, n_schema = len(arguments), len(props)
+    reject_msg = (
+        "gemma4 args: got %d keys, schema declares %d — possible "
+        '<|"|> fragmentation; dropping truncated tool call %r'
+    )
+    if len(targets) != 1:
+        logger.warning(reject_msg, n_keys, n_schema, func_name)
+        return None
+
+    target = targets[0]
+    target_value = arguments[target]
+    if not isinstance(target_value, str):
+        logger.warning(reject_msg, n_keys, n_schema, func_name)
+        return None
+
+    extras_start = keys.index(target) + 1
+    extra_items = [(k, arguments[k]) for k in keys[extras_start:]]
+    if not extra_items or not all(
+        _gemma4_joinable_extra_value(v) for _, v in extra_items
+    ):
+        logger.warning(reject_msg, n_keys, n_schema, func_name)
+        return None
+
+    rebuilt = target_value
+    for extra_key, extra_val in extra_items:
+        piece = (
+            extra_val if isinstance(extra_val, str) else json.dumps(extra_val)
+        )
+        rebuilt += extra_key + ":" + piece
+
+    kept = {
+        k: arguments[k]
+        for k in keys[: extras_start - 1]
+        if k in schema_keys
+    }
+    kept[target] = rebuilt
+    logger.warning(
+        "gemma4 args: got %d keys, schema declares %d — reassembled "
+        'fragmented <|"|> args for %r',
+        n_keys,
+        n_schema,
+        func_name,
+    )
+    return kept
+
+
+def _parse_gemma4_tool_call_fallback(
+    text: str, tools: Optional[List] = None
+) -> Union[dict, list]:
     """Robust fallback parser for Gemma 4 ``call:name{args}`` format.
 
     Activated only for Gemma 4 models (guarded by the ``tool_call_start``
@@ -1889,6 +2020,11 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
     that is a post-parse concern handled by ``_remap_tool_call_names`` so
     it covers every producer path (native parser, this fallback, XML
     recovery, thinking-content promotion), not just this one.
+
+    ``tools`` (when provided) drives the #3229 fragmentation tripwire:
+    parsed args with more top-level keys than the tool schema declares
+    are reassembled into the unique string field they spilled from, or
+    the call is dropped.  With no tools the parsed dict is kept as-is.
     """
     squote_closes = _squote_close_positions(text)
 
@@ -1923,6 +2059,14 @@ def _parse_gemma4_tool_call_fallback(text: str) -> Union[dict, list]:
         except (ValueError, json.JSONDecodeError, RecursionError):
             continue  # one malformed call must not drop its siblings
         if not isinstance(arguments, dict):
+            continue
+        arguments = _gemma4_reassemble_or_reject_fragmented_args(
+            arguments, m.group(1), tools
+        )
+        if arguments is None:
+            # Tripwire fired but the extras were not the markdown
+            # fragmentation shape.  Skip this call rather than returning
+            # silently truncated arguments (#3229).
             continue
         results.append({"name": m.group(1), "arguments": arguments})
         consumed_until = end
@@ -2118,6 +2262,17 @@ def _parse_tool_calls_impl(
                         name = p.get("name", "")
                         arguments = p.get("arguments", {})
                         if (
+                            tool_call_start == "<|tool_call>"
+                            and isinstance(arguments, dict)
+                        ):
+                            arguments = (
+                                _gemma4_reassemble_or_reject_fragmented_args(
+                                    arguments, name, tools
+                                )
+                            )
+                            if arguments is None:
+                                continue
+                        if (
                             getattr(tool_parser, "__module__", None)
                             in (
                                 "mlx_lm.tool_parsers.qwen3_coder",
@@ -2170,7 +2325,7 @@ def _parse_tool_calls_impl(
                     if tool_call_start == "<|tool_call>":
                         try:
                             parsed = _parse_gemma4_tool_call_fallback(
-                                match.strip()
+                                match.strip(), tools
                             )
                             items = (
                                 parsed if isinstance(parsed, list) else [parsed]
