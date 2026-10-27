@@ -233,9 +233,11 @@ def _args_fit_schema(
     ``None`` so the caller drops the tool call.  No properties, or no
     extra keys, leaves ``arguments`` unchanged.
     """
-    if not isinstance(arguments, dict):
-        return arguments
-    if not props or len(arguments) <= len(props):
+    if (
+        not isinstance(arguments, dict)
+        or not props
+        or len(arguments) <= len(props)
+    ):
         return arguments
     if reassemble is not None:
         fitted = reassemble(arguments, props)
