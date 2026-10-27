@@ -3924,7 +3924,7 @@ class TestStreamingHelperFunctions:
                     new_text=raw,
                     completion_tokens=2,
                     finished=True,
-                    finish_reason="stop",
+                    finish_reason="length",
                     tool_calls=None,
                 )
             ]
@@ -4004,7 +4004,7 @@ class TestStreamingHelperFunctions:
                     new_text=raw,
                     completion_tokens=2,
                     finished=True,
-                    finish_reason="stop",
+                    finish_reason="length",
                     tool_calls=None,
                 )
             ]
@@ -4998,6 +4998,51 @@ async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize(
+    "qwen_parser", [True, False], ids=["qwen3_coder", "no_qwen_parser"]
+)
+async def test_unclosed_marker_in_reasoning_keeps_answer(api, qwen_parser):
+    raw = "<think>I could wrap a <tool_call> to write it, but no.</think>Done."
+    events = await _recovery_stream(raw, api, qwen_parser=qwen_parser)
+
+    assert _recovery_error_codes(events, api) == []
+    assert _recovery_text(events, api) == "Done."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_length_cut_payload_without_qwen_parser_keeps_length(api):
+    events = await _recovery_stream(
+        _RECOVERY_TRUNCATED_JSON, api, finish_reason="length", qwen_parser=False
+    )
+
+    assert _recovery_error_codes(events, api) == []
+    assert _recovery_text(events, api) == _RECOVERY_TRUNCATED_JSON
+    if api == "chat":
+        assert _chat_finish_reasons(events) == ["length"]
+
+
+def test_nonstream_length_cut_payload_without_qwen_parser_keeps_length(monkeypatch):
+    client = _nonstream_tool_call_client(
+        monkeypatch,
+        _RECOVERY_TRUNCATED_JSON,
+        qwen_parser=False,
+        finish_reason="length",
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json=_NONSTREAM_RECOVERY_REQUESTS["/v1/chat/completions"],
+    )
+    client.close()
+
+    assert response.status_code == 200, response.text
+    choice = response.json()["choices"][0]
+    assert choice["message"]["content"] == _RECOVERY_TRUNCATED_JSON
+    assert choice["finish_reason"] == "length"
+
+
+@pytest.mark.asyncio
 async def test_recoverable_quoted_marker_without_qwen_parser():
     """Quoted-marker prose must still recover when parse_errors is empty."""
     events = await _recovery_stream(_RECOVERY_PROSE, "chat", qwen_parser=False)
@@ -5099,7 +5144,9 @@ async def test_recovered_prose_reaches_responses_final_text():
     assert done == completed == [_RECOVERY_PROSE]
 
 
-def _nonstream_tool_call_client(monkeypatch, body: str, *, qwen_parser=True):
+def _nonstream_tool_call_client(
+    monkeypatch, body: str, *, qwen_parser=True, finish_reason="stop"
+):
     """Return a client whose model generates ``body`` for non-stream requests."""
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -5128,7 +5175,7 @@ def _nonstream_tool_call_client(monkeypatch, body: str, *, qwen_parser=True):
         new_text=body,
         completion_tokens=4,
         finished=True,
-        finish_reason="stop",
+        finish_reason=finish_reason,
     )
     monkeypatch.setattr(engine, "generate", AsyncMock(return_value=output))
 
@@ -5183,10 +5230,21 @@ _NONSTREAM_RECOVERY_REQUESTS = {
 
 
 @pytest.mark.parametrize("path", list(_NONSTREAM_RECOVERY_REQUESTS))
-@pytest.mark.parametrize("raw", [_RECOVERY_PROSE, _RECOVERY_PROSE_REPEAT])
-def test_nonstream_quoted_marker_is_delivered(monkeypatch, path, raw):
+@pytest.mark.parametrize(
+    "raw,tools",
+    [
+        (_RECOVERY_PROSE, True),
+        (_RECOVERY_PROSE_REPEAT, True),
+        # Markup is filtered only for tool requests, like the stream path.
+        (_RECOVERY_TRUNCATED_JSON, False),
+    ],
+)
+def test_nonstream_quoted_marker_is_delivered(monkeypatch, path, raw, tools):
+    request = dict(_NONSTREAM_RECOVERY_REQUESTS[path])
+    if not tools:
+        del request["tools"]
     client = _nonstream_tool_call_client(monkeypatch, raw)
-    response = client.post(path, json=_NONSTREAM_RECOVERY_REQUESTS[path])
+    response = client.post(path, json=request)
     client.close()
 
     assert response.status_code == 200, response.text

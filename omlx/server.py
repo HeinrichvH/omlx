@@ -6340,45 +6340,40 @@ def _tool_call_failure(
     return _openai_error_body(message, 500, code=code)
 
 
-def _recovery_candidate_is_payload(
-    tool_filter: ToolCallStreamFilter | None,
-    thinking_filter: ToolCallStreamFilter | None,
-) -> bool:
-    """Whether either channel withheld a truncated call, not quoted prose.
-
-    Must be read before ``take_recovery_candidate``: taking clears the tail.
-    """
-    return any(
-        f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
-    )
-
-
 def _take_recoverable_withheld_text(
     tool_filter: ToolCallStreamFilter | None,
     thinking_filter: ToolCallStreamFilter | None,
     tool_calls: object,
     parse_errors: tuple,
     streamed_tool_calls: list | None = None,
-) -> tuple[str, str]:
-    """Drain withheld envelope text and return the (thinking, content) to emit.
+    finish_reason: str | None = None,
+) -> tuple[str, str, bool]:
+    """Drain withheld envelope text and return (thinking, content, payload).
 
     A marker quoted in prose fails parsing as "incomplete" like a truncated
     call. Recover the text only when no call was produced, every error is
     "incomplete", and no withheld opener in either channel starts a payload.
-    A payload is never recovered as content, even when parse_errors is empty
+    A content payload is never recovered, even when parse_errors is empty
     (parsers other than qwen3_coder do not populate parse_errors).
+    ``payload`` reports only the content channel: reasoning may quote an
+    opener without making a call. A length cut keeps its own finish reason.
     """
-    is_payload = _recovery_candidate_is_payload(tool_filter, thinking_filter)
+    content_payload = bool(tool_filter and tool_filter.recovery_candidate_is_payload())
+    is_payload = content_payload or bool(
+        thinking_filter and thinking_filter.recovery_candidate_is_payload()
+    )
+    stopped_in_call = content_payload and finish_reason != "length"
     thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
     content = tool_filter.take_recovery_candidate() if tool_filter else ""
     if (
         tool_calls
         or streamed_tool_calls
+        or stopped_in_call
         or any(error != "incomplete" for error in parse_errors)
-        or is_payload
+        or (parse_errors and is_payload)
     ):
-        return "", ""
-    return thinking, content
+        return "", "", stopped_in_call
+    return thinking, content, False
 
 
 def _finalize_withheld_recovery(
@@ -6388,17 +6383,25 @@ def _finalize_withheld_recovery(
     parse_errors: tuple,
     tool_failure: dict | None,
     streamed_tool_calls: list | None = None,
+    *,
+    finish_reason: str | None,
 ) -> tuple[str, str, dict | None]:
     """Recover quoted-marker prose, or fail a withheld truncated payload.
 
     Do not clear an existing tool_failure when recovery is skipped because
-    the withheld tail is a payload. Surface incomplete_tool_call when a
-    payload was withheld and no structured tool_calls were produced, even
-    if parse_errors is empty.
+    the withheld tail is a payload. Surface incomplete_tool_call when content
+    withheld a payload and no structured tool_calls were produced, even if
+    parse_errors is empty.
     """
-    withheld_payload = _recovery_candidate_is_payload(tool_filter, thinking_filter)
-    recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
+    recovered_thinking, recovered_content, withheld_payload = (
+        _take_recoverable_withheld_text(
+            tool_filter,
+            thinking_filter,
+            tool_calls,
+            parse_errors,
+            streamed_tool_calls,
+            finish_reason,
+        )
     )
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
@@ -6421,7 +6424,8 @@ def _nonstream_recovery_text(
     in prose. A truncated call payload is never recovered as content, even
     when parse_errors is empty (non-qwen3_coder).
     """
-    if extraction.tool_calls:
+    # Streams filter tool markup only when tools are declared.
+    if extraction.tool_calls or not tools:
         return None, False
     failed = extraction.parse_errors
     if any(error != "incomplete" for error in failed):
@@ -6439,7 +6443,8 @@ def _nonstream_recovery_text(
     withheld_payload = probe.recovery_candidate_is_payload()
     recovered = probe.take_recovery_candidate()
     if withheld_payload:
-        return None, True
+        # A length cut keeps its own finish reason.
+        return None, output.finish_reason != "length"
     if recovered:
         return raw_text, False
     return None, False
@@ -6999,6 +7004,7 @@ async def stream_chat_completion(
         parse_errors,
         tool_failure,
         streamed_tool_calls,
+        finish_reason=last_output.finish_reason if last_output else "stop",
     )
     if not tool_calls and not tool_failure:
         if recovered_thinking:
@@ -7563,7 +7569,12 @@ async def stream_anthropic_messages(
         tool_failure = _tool_call_failure(extraction)
 
     recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
-        tool_filter, thinking_filter, tool_calls, parse_errors, tool_failure
+        tool_filter,
+        thinking_filter,
+        tool_calls,
+        parse_errors,
+        tool_failure,
+        finish_reason=last_output.finish_reason if last_output else "stop",
     )
     if not tool_calls and not tool_failure:
         if recovered_thinking:
@@ -9500,7 +9511,12 @@ async def stream_responses_api(
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     recovered_thinking, recovered_content, tool_failure = _finalize_withheld_recovery(
-        tool_filter, thinking_filter, tool_calls, parse_errors, tool_failure
+        tool_filter,
+        thinking_filter,
+        tool_calls,
+        parse_errors,
+        tool_failure,
+        finish_reason=last_output.finish_reason if last_output else "stop",
     )
     if recovered_content:
         # The parser strips the prose before the marker, so rebuild the final
