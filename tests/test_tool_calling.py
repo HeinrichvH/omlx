@@ -26,8 +26,10 @@ from omlx.api.openai_models import (
 from omlx.api.tool_calling import (
     ToolCallStreamFilter,
     _coerce_param_value,
+    _args_fit_schema,
     _gemma4_args_to_json_robust,
-    _gemma4_reassemble_or_reject_fragmented_args,
+    _gemma4_fit_args,
+    _gemma4_reassemble_extras,
     _json_value_end,
     _marker_payloads,
     _parse_attribute_function_tool_calls,
@@ -3064,7 +3066,7 @@ class TestGemma4ArgsFragmentation3229:
             ): "** The FAU is mounted on a specialized flexure mechanism...",
             "* Technoprobe Official": ["https://www.technoprobe.com/"],
         }
-        kept = _gemma4_reassemble_or_reject_fragmented_args(
+        kept = _gemma4_fit_args(
             fragmented, "create-pdf-file", _PDF_TOOLS_3229
         )
         assert kept is not None
@@ -3075,6 +3077,26 @@ class TestGemma4ArgsFragmentation3229:
             in content
         )
         assert "* Technoprobe Official:" in content
+
+    def test_args_fit_schema_rejects_without_reassemble(self):
+        """Shared tripwire rejects extras; it does not keep truncated success."""
+        props = {
+            "filename": {"type": "string"},
+            "content": {"type": "string"},
+        }
+        exact = {"filename": "a.pdf", "content": "hello"}
+        assert _args_fit_schema(exact, props) == exact
+        assert _args_fit_schema({"a": 1, "b": 2, "c": 3}, props) is None
+        oversized = {"content": "hello", "extra": "x", "more": "y"}
+        assert _args_fit_schema(oversized, {}) == oversized
+        fitted = _gemma4_reassemble_extras(
+            {"content": "hello", " Dual-Functionality": "** Unlike"},
+            props,
+        )
+        assert fitted == {"content": "hello Dual-Functionality:** Unlike"}
+        assert _args_fit_schema(
+            oversized, props, reassemble=_gemma4_reassemble_extras
+        ) == {"content": "helloextra:xmore:y"}
 
 
 class TestParseToolCallsGemma4Integration:
